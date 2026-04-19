@@ -1,4 +1,4 @@
-# golangci-lint configuration for pgxtx
+# golangci-lint configuration for racache
 # https://golangci-lint.run/usage/configuration/
 
 version: "2"
