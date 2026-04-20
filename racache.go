@@ -75,7 +75,7 @@ func WithOnAsyncError(callback func(ctx context.Context, err error)) OptionFunc 
 }
 
 // FallbackFunc returns the value to be used on cache miss or async refresh.
-type FallbackFunc[T any] func(ctx context.Context) (T, error)
+type FallbackFunc[T any] = func(ctx context.Context) (T, error)
 
 // New creates Cache with the provided valkey client and entry TTL.
 func New[T any](client valkey.Client, ttl time.Duration, opts ...OptionFunc) *Cache[T] {
