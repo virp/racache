@@ -7,6 +7,7 @@ The package is useful when you need to:
 - quickly return a typed value from cache;
 - synchronously load data from the data source on a `cache miss`;
 - refresh a value in the background shortly before its TTL expires;
+- coordinate refresh-ahead work across service instances with an optional Valkey lock;
 - configure separate timeouts for cache reads and writes.
 
 ## Breaking change
@@ -36,9 +37,12 @@ Valkey will store the JSON value `"value"`, not the raw string `value`.
 `Get(ctx, key, fallback)` performs `GET` and `EXPIRETIME` for the key, then behaves as follows:
 
 - on `cache hit`, it decodes JSON from cache into `T` and returns the value;
-- on `cache miss`, it synchronously calls `fallback`, returns its result, and performs an asynchronous `SET`;
-- if reading from cache finishes with a `WithGetTimeout` timeout, it behaves like a `cache miss`: synchronously calls `fallback`, returns its result, and performs an asynchronous `SET`;
-- on `cache hit`, if the remaining TTL is less than or equal to the configured threshold, it immediately returns the current cached value and starts a background refresh through `fallback`.
+- on `cache miss`, it synchronously loads the value through `fallback`, returns its result, and performs an asynchronous `SET`;
+- if reading from cache finishes with a `WithGetTimeout` timeout, it behaves like a `cache miss`: synchronously loads the value through `fallback`, returns its result, and performs an asynchronous `SET`;
+- on `cache hit`, if the remaining TTL is less than or equal to the configured threshold, it immediately returns the current cached value and starts a background refresh through `fallback`;
+- concurrent cache misses or `WithGetTimeout` fallbacks for the same key share one in-process `fallback` call and one asynchronous cache population write;
+- concurrent refresh-ahead attempts for the same key share one in-process background refresh;
+- when `WithDistributedLock` is enabled, refresh-ahead also acquires `lock:<cache-key>` in Valkey before running `fallback`, so only the lock owner refreshes the value across service instances.
 
 On `cache miss`, there is no reverse deserialization `T -> JSON -> T`: the `fallback` result is returned directly to the caller. JSON is only needed for writing to Valkey.
 
@@ -122,6 +126,7 @@ If `ttl <= 0`, `New` panics.
   - `1` means refresh may be started on every cache hit;
   - values less than `0` are clamped to `0`;
   - values greater than `1` are clamped to `1`;
+- `WithDistributedLock(lockTTL)` enables a Valkey-backed lock for refresh-ahead coordination across service instances. If this option is passed with `lockTTL <= 0`, `New` panics;
 - `WithOnAsyncError(callback)` registers a callback for errors from background `fallback`, serialization, and writes.
 
 ## Usage scenarios
@@ -129,6 +134,8 @@ If `ttl <= 0`, `New` panics.
 ### 1. `Cache miss` with synchronous `fallback`
 
 If the value is not in cache, `fallback` is called immediately. Its result is returned to the caller, while cache population happens in the background.
+
+Concurrent misses for the same key inside one process are deduplicated: the first caller runs `fallback`, and other callers wait for the same value or error. Only one asynchronous cache population write is started for that shared load.
 
 ```go
 type Product struct {
@@ -161,6 +168,25 @@ With a `10m` TTL and a `0.15` threshold, the background refresh starts when the 
 
 This reduces the chance that a user request will hit the data source exactly when the TTL expires.
 
+Concurrent refresh-ahead attempts for the same key inside one process are deduplicated. While one background refresh is running, other `Get` calls return the cached value without starting another refresh.
+
+To coordinate refreshes across several service instances, enable the distributed lock:
+
+```go
+cache := racache.New[Product](
+	client,
+	10*time.Minute,
+	racache.WithThreshold(0.15),
+	racache.WithDistributedLock(30*time.Second),
+)
+```
+
+The lock key is `lock:<cache-key>`, where `<cache-key>` already includes `WithPrefix`. For example, with `WithPrefix("es")` and key `"123"`, the lock key is `lock:es:123`.
+
+The lock is acquired with `SET lock:<cache-key> <token> NX PX <lockTTL>` before the background refresh. If the lock is already held, this instance skips the refresh. After refresh completion, the lock is released by a Lua script that deletes it only when the owner token still matches. Lock acquisition and release errors are reported through `WithOnAsyncError` and do not affect the `Get` result.
+
+Choose a `lockTTL` longer than the expected `fallback + Set` duration. If `fallback` can exceed the lock TTL, another instance may acquire the lock after expiration and start a second refresh.
+
 ### 3. Separate read and write timeouts
 
 ```go
@@ -186,21 +212,13 @@ cache := racache.New[Product](
 )
 ```
 
-The callback is called for errors from background `fallback`, serialization, and `Set` during refresh-ahead, as well as for errors from the asynchronous `Set` after a cache miss.
+The callback is called for errors from background `fallback`, serialization, `Set`, distributed lock acquisition, and distributed lock release during refresh-ahead, as well as for errors from the asynchronous `Set` after a cache miss.
 
 ## Current limitations and plans
 
-At the current stage, the package does not deduplicate background refresh operations by key.
-This means that if several requests simultaneously enter the `refresh-ahead` window for the same key, they may concurrently:
+Local cache miss/load deduplication is process-local. If the same service runs in several instances and a key is missing, each instance can still start one synchronous load for that key.
 
-- call `fallback`;
-- execute `Set`;
-- refresh the same value multiple times.
-
-The plan to remove this limitation has already been prepared and is described in [TODO.md](./TODO.md):
-
-- local refresh deduplication by key inside the process;
-- an optional `distributed lock` in Valkey for scenarios with multiple service instances.
+Cross-instance distributed locking is available only for refresh-ahead on cache hits through `WithDistributedLock`. It is not used for cache misses or `WithGetTimeout` fallback loads.
 
 ## API summary
 
@@ -217,6 +235,7 @@ func WithGetTimeout(timeout time.Duration) OptionFunc
 func WithSetTimeout(timeout time.Duration) OptionFunc
 func WithPrefix(prefix string) OptionFunc
 func WithThreshold(threshold float64) OptionFunc
+func WithDistributedLock(lockTTL time.Duration) OptionFunc
 func WithOnAsyncError(callback func(ctx context.Context, err error)) OptionFunc
 ```
 
@@ -224,9 +243,13 @@ func WithOnAsyncError(callback func(ctx context.Context, err error)) OptionFunc
 
 - the package stores values as Valkey JSON strings;
 - if `WithPrefix` is set, all Valkey commands use keys in the `prefix:key` format;
+- concurrent cache misses and `WithGetTimeout` fallbacks for the same key are deduplicated inside one process;
+- concurrent refresh-ahead attempts for the same key are deduplicated inside one process;
+- `WithDistributedLock` adds cross-instance coordination only for refresh-ahead on cache hits;
+- distributed lock keys use `lock:<cache-key>` and are safely released only by matching owner token;
 - `fallback` runs synchronously on cache miss and asynchronously during refresh-ahead;
 - background work uses `context.WithoutCancel(ctx)`, so refresh is not canceled when the original context is canceled;
-- `WithOnAsyncError` handles errors from background `fallback`, serialization, and `Set` during refresh-ahead, as well as errors from the asynchronous `Set` after a cache miss;
+- `WithOnAsyncError` handles errors from background `fallback`, serialization, `Set`, and distributed lock operations during refresh-ahead, as well as errors from the asynchronous `Set` after a cache miss;
 - if reading from Valkey fails, `Get` returns the error and does not call `fallback`, except for the `WithGetTimeout` timeout case;
 - if reading from cache finishes with a `WithGetTimeout` timeout, `Get` uses `fallback` the same way as on `cache miss`;
 - if cached JSON cannot be decoded into `T`, `Get` returns an error and does not call `fallback`;
