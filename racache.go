@@ -2,8 +2,11 @@ package racache
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/valkey-io/valkey-go"
@@ -18,6 +21,18 @@ type Cache[T any] struct {
 	threshold    float64
 	prefix       string
 	onAsyncError func(ctx context.Context, err error)
+
+	distributedLockTTL time.Duration
+	refreshMu          sync.Mutex
+	refreshInFlight    map[string]struct{}
+	loadMu             sync.Mutex
+	loadInFlight       map[string]*loadCall[T]
+}
+
+type loadCall[T any] struct {
+	wg    sync.WaitGroup
+	value T
+	err   error
 }
 
 type options struct {
@@ -26,6 +41,9 @@ type options struct {
 	threshold    float64
 	prefix       string
 	onAsyncError func(ctx context.Context, err error)
+
+	distributedLockSet bool
+	distributedLockTTL time.Duration
 }
 
 // OptionFunc configures Cache during construction.
@@ -74,6 +92,14 @@ func WithOnAsyncError(callback func(ctx context.Context, err error)) OptionFunc 
 	}
 }
 
+// WithDistributedLock enables a Valkey-backed lock for cross-instance refresh-ahead coordination.
+func WithDistributedLock(lockTTL time.Duration) OptionFunc {
+	return func(opts *options) {
+		opts.distributedLockSet = true
+		opts.distributedLockTTL = lockTTL
+	}
+}
+
 // FallbackFunc returns the value to be used on cache miss or async refresh.
 type FallbackFunc[T any] = func(ctx context.Context) (T, error)
 
@@ -87,6 +113,9 @@ func New[T any](client valkey.Client, ttl time.Duration, opts ...OptionFunc) *Ca
 	for _, opt := range opts {
 		opt(&cfg)
 	}
+	if cfg.distributedLockSet && cfg.distributedLockTTL <= 0 {
+		panic("distributed lock ttl must be greater than zero")
+	}
 
 	cache := Cache[T]{
 		client:       client,
@@ -96,6 +125,10 @@ func New[T any](client valkey.Client, ttl time.Duration, opts ...OptionFunc) *Ca
 		threshold:    cfg.threshold,
 		prefix:       cfg.prefix,
 		onAsyncError: cfg.onAsyncError,
+
+		distributedLockTTL: cfg.distributedLockTTL,
+		refreshInFlight:    make(map[string]struct{}),
+		loadInFlight:       make(map[string]*loadCall[T]),
 	}
 
 	return &cache
@@ -130,7 +163,7 @@ func (c *Cache[T]) Get(ctx context.Context, key string, fallback FallbackFunc[T]
 	if err != nil {
 		if valkey.IsValkeyNil(err) || (errors.Is(err, context.DeadlineExceeded) && c.getTimeout > 0) {
 			var fallbackValue T
-			fallbackValue, err = c.doFallbackAndSet(ctx, backgroundCtx, cacheKey, fallback)
+			fallbackValue, err = c.loadWithDedup(ctx, backgroundCtx, cacheKey, fallback)
 			if err != nil {
 				return zero, err
 			}
@@ -149,7 +182,7 @@ func (c *Cache[T]) Get(ctx context.Context, key string, fallback FallbackFunc[T]
 	expDuration := time.Until(time.Unix(exp, 0))
 
 	if expDuration.Seconds()/c.cacheTTL.Seconds() <= c.threshold {
-		c.refreshInBackground(backgroundCtx, cacheKey, fallback)
+		c.tryStartBackgroundRefresh(backgroundCtx, cacheKey, fallback)
 	}
 
 	return value, nil
@@ -196,37 +229,96 @@ func (c *Cache[T]) setString(ctx context.Context, key, value string) error {
 	return nil
 }
 
-func (c *Cache[T]) doFallbackAndSet(fallbackCtx, setCtx context.Context, key string, fallback FallbackFunc[T]) (T, error) {
-	var zero T
-
-	value, err := fallback(fallbackCtx)
-	if err != nil {
-		return zero, fmt.Errorf("fallback: %w", err)
+func (c *Cache[T]) loadWithDedup(
+	fallbackCtx, setCtx context.Context,
+	key string,
+	fallback FallbackFunc[T],
+) (T, error) {
+	c.loadMu.Lock()
+	if call, ok := c.loadInFlight[key]; ok {
+		c.loadMu.Unlock()
+		call.wg.Wait()
+		return call.value, call.err
 	}
 
-	str, err := marshalValue(value)
-	if err != nil {
-		return zero, err
+	call := &loadCall[T]{}
+	call.wg.Add(1)
+	c.loadInFlight[key] = call
+	c.loadMu.Unlock()
+
+	var str string
+	call.value, str, call.err = resolveFallback(fallbackCtx, fallback)
+	if call.err == nil {
+		c.setStringInBackground(setCtx, key, str)
 	}
 
-	go func() {
-		if setErr := c.setString(setCtx, key, str); setErr != nil {
-			c.reportAsyncError(setCtx, setErr)
-		}
-	}()
+	call.wg.Done()
 
-	return value, nil
+	c.loadMu.Lock()
+	delete(c.loadInFlight, key)
+	c.loadMu.Unlock()
+
+	return call.value, call.err
 }
 
-func (c *Cache[T]) refreshInBackground(ctx context.Context, key string, fallback FallbackFunc[T]) {
+func resolveFallback[T any](ctx context.Context, fallback FallbackFunc[T]) (value T, str string, err error) {
+	var zero T
+
+	value, err = fallback(ctx)
+	if err != nil {
+		return zero, "", fmt.Errorf("fallback: %w", err)
+	}
+
+	str, err = marshalValue(value)
+	if err != nil {
+		return zero, "", err
+	}
+
+	return value, str, nil
+}
+
+func (c *Cache[T]) setStringInBackground(ctx context.Context, key, value string) {
 	go func() {
-		value, err := fallback(ctx)
-		if err != nil {
-			c.reportAsyncError(ctx, fmt.Errorf("fallback: %w", err))
-			return
+		if setErr := c.setString(ctx, key, value); setErr != nil {
+			c.reportAsyncError(ctx, setErr)
+		}
+	}()
+}
+
+func (c *Cache[T]) tryStartBackgroundRefresh(ctx context.Context, key string, fallback FallbackFunc[T]) {
+	c.refreshMu.Lock()
+	if _, ok := c.refreshInFlight[key]; ok {
+		c.refreshMu.Unlock()
+		return
+	}
+
+	c.refreshInFlight[key] = struct{}{}
+	c.refreshMu.Unlock()
+
+	go func() {
+		defer func() {
+			c.refreshMu.Lock()
+			delete(c.refreshInFlight, key)
+			c.refreshMu.Unlock()
+		}()
+
+		if c.distributedLockTTL > 0 {
+			acquired, token, err := c.acquireDistributedLock(ctx, key)
+			if err != nil {
+				c.reportAsyncError(ctx, err)
+				return
+			}
+			if !acquired {
+				return
+			}
+			defer func() {
+				if err := c.releaseDistributedLock(ctx, key, token); err != nil {
+					c.reportAsyncError(ctx, err)
+				}
+			}()
 		}
 
-		str, err := marshalValue(value)
+		_, str, err := resolveFallback(ctx, fallback)
 		if err != nil {
 			c.reportAsyncError(ctx, err)
 			return
@@ -236,6 +328,65 @@ func (c *Cache[T]) refreshInBackground(ctx context.Context, key string, fallback
 			c.reportAsyncError(ctx, err)
 		}
 	}()
+}
+
+func (c *Cache[T]) acquireDistributedLock(ctx context.Context, key string) (acquired bool, token string, err error) {
+	token, err = newDistributedLockToken()
+	if err != nil {
+		return false, "", fmt.Errorf("generate distributed lock token: %w", err)
+	}
+
+	acquired, err = c.client.Do(
+		ctx,
+		c.client.B().
+			Set().
+			Key(distributedLockKey(key)).
+			Value(token).
+			Nx().
+			Px(c.distributedLockTTL).
+			Build(),
+	).AsBool()
+	if valkey.IsValkeyNil(err) {
+		return false, "", nil
+	}
+	if err != nil {
+		return false, "", fmt.Errorf("acquire distributed lock: %w", err)
+	}
+
+	return acquired, token, nil
+}
+
+const releaseDistributedLockScript = `if redis.call("GET", KEYS[1]) == ARGV[1] then return redis.call("DEL", KEYS[1]) end return 0`
+
+func (c *Cache[T]) releaseDistributedLock(ctx context.Context, key, token string) error {
+	_, err := c.client.Do(
+		ctx,
+		c.client.B().
+			Eval().
+			Script(releaseDistributedLockScript).
+			Numkeys(1).
+			Key(distributedLockKey(key)).
+			Arg(token).
+			Build(),
+	).AsInt64()
+	if err != nil {
+		return fmt.Errorf("release distributed lock: %w", err)
+	}
+
+	return nil
+}
+
+func distributedLockKey(key string) string {
+	return "lock:" + key
+}
+
+func newDistributedLockToken() (string, error) {
+	var token [16]byte
+	if _, err := rand.Read(token[:]); err != nil {
+		return "", err
+	}
+
+	return hex.EncodeToString(token[:]), nil
 }
 
 func (c *Cache[T]) reportAsyncError(ctx context.Context, err error) {
